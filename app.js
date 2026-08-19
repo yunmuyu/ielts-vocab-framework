@@ -17,9 +17,15 @@ let screen = localStorage.getItem('pwaScreen') || 'study';
 let recall = null;
 let quiz = null;
 let storyListOpen = false;
+let storyEditMode = false;
+let longPressTimer = null;
+let longPressOrigin = null;
+let suppressStoryClick = false;
 let recallAnswersVisible = false;
 let pendingPack = null;
 let deferredPrompt = null;
+let speechEnabled = localStorage.getItem('pwaSpeechEnabled') !== 'false';
+const speechSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 
 function clone(value) { return JSON.parse(JSON.stringify(value)); }
 function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char])); }
@@ -99,15 +105,81 @@ function saveRecall() { localStorage.setItem(key('recall'), JSON.stringify(recal
 function loadQuiz() { quiz = JSON.parse(localStorage.getItem(key('quiz')) || 'null') || (DEFAULT_COMPLETE_GROUPS.has(GROUPS[gi].id) ? { index: GROUPS[gi].quiz.length, score: GROUPS[gi].quiz.length, wrong: [], locked: false } : { index: 0, score: 0, wrong: [], locked: false }); }
 function saveQuiz() { localStorage.setItem(key('quiz'), JSON.stringify(quiz)); }
 
+function speakWord(word) {
+  if (!speechEnabled || !speechSupported) return;
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(word);
+  utterance.lang = 'en-US';
+  utterance.rate = 0.86;
+  window.speechSynthesis.speak(utterance);
+}
+function renderSpeechToggle() {
+  const button = $('#speechToggle');
+  if (!button) return;
+  button.disabled = !speechSupported;
+  button.textContent = speechSupported ? `自动发音：${speechEnabled ? '开' : '关'}` : '自动发音：不可用';
+  button.setAttribute('aria-pressed', String(speechEnabled));
+  button.title = speechSupported ? '点击关闭或开启故事词汇的自动发音' : '当前浏览器不支持网页发音';
+}
+function toggleSpeech() {
+  if (!speechSupported) return;
+  speechEnabled = !speechEnabled;
+  localStorage.setItem('pwaSpeechEnabled', String(speechEnabled));
+  if (!speechEnabled) window.speechSynthesis.cancel();
+  renderSpeechToggle();
+}
+
 function renderGroups() {
   const sorted = GROUPS.map((group, index) => ({ group, index, complete: isStoryComplete(group) })).sort((a, b) => Number(a.complete) - Number(b.complete) || a.index - b.index);
   const visible = sorted.slice(0, 3);
   const overflow = sorted.slice(3);
   if (!overflow.length) storyListOpen = false;
-  const button = item => `<button class="story-option ${item.index === gi ? 'active' : ''}" data-group-index="${item.index}"><span>${escapeHtml(storyMeta(item.group).topics[0])}</span>${item.complete ? '<b class="story-check">✓</b>' : ''}</button>`;
-  $('#groups').innerHTML = `<div class="story-strip">${visible.map(button).join('')}</div>${overflow.length ? `<button class="story-more-toggle" id="storyMoreToggle"><span>更多故事</span><span>${storyListOpen ? '⌃' : '⌄'}</span></button><div class="story-list ${storyListOpen ? 'open' : ''}">${overflow.map(button).join('')}</div>` : ''}`;
-  if (overflow.length) $('#storyMoreToggle').onclick = () => { storyListOpen = !storyListOpen; renderGroups(); };
-  $$('.story-option').forEach(buttonElement => buttonElement.onclick = () => { gi = Number(buttonElement.dataset.groupIndex); storyListOpen = false; localStorage.setItem('pwaGroup', String(gi)); loadRecall(); loadQuiz(); renderGroups(); renderAll(); });
+  const button = item => `<div class="story-option-wrap"><button class="story-option ${item.index === gi ? 'active' : ''}" data-group-index="${item.index}" title="长按进入故事编辑模式"><span>${escapeHtml(storyMeta(item.group).topics[0])}</span>${item.complete ? '<b class="story-check">✓</b>' : ''}</button>${storyEditMode ? `<button class="story-remove" data-story-delete="${item.index}" aria-label="删除故事：${escapeHtml(storyMeta(item.group).topics[0])}" title="${GROUPS.length > 1 ? '删除这个故事' : '至少保留一个故事'}" ${GROUPS.length <= 1 ? 'disabled' : ''}>×</button>` : ''}</div>`;
+  const moreToggle = overflow.length && !storyEditMode ? `<button class="story-more-toggle" id="storyMoreToggle"><span>更多故事</span><span>${storyListOpen ? '⌃' : '⌄'}</span></button>` : '';
+  const editBar = storyEditMode ? '<div class="story-edit-bar"><span>编辑故事</span><button id="storyEditDone" type="button">完成</button></div>' : '';
+  $('#groups').innerHTML = `${editBar}<div class="story-strip">${visible.map(button).join('')}</div>${overflow.length ? `${moreToggle}<div class="story-list ${storyListOpen || storyEditMode ? 'open' : ''}">${overflow.map(button).join('')}</div>` : ''}`;
+  if (overflow.length && !storyEditMode) $('#storyMoreToggle').onclick = () => { storyListOpen = !storyListOpen; renderGroups(); };
+  if (storyEditMode) $('#storyEditDone').onclick = () => { storyEditMode = false; storyListOpen = false; suppressStoryClick = false; renderGroups(); };
+  bindStoryPicker();
+}
+function cancelLongPress() {
+  if (longPressTimer) clearTimeout(longPressTimer);
+  longPressTimer = null;
+  longPressOrigin = null;
+}
+function enterStoryEditMode() {
+  cancelLongPress();
+  suppressStoryClick = true;
+  storyEditMode = true;
+  storyListOpen = true;
+  renderGroups();
+}
+function bindStoryPicker() {
+  $$('.story-option').forEach(buttonElement => {
+    buttonElement.onclick = () => {
+      if (suppressStoryClick) { suppressStoryClick = false; return; }
+      gi = Number(buttonElement.dataset.groupIndex);
+      storyListOpen = false;
+      localStorage.setItem('pwaGroup', String(gi));
+      loadRecall();
+      loadQuiz();
+      renderGroups();
+      renderAll();
+    };
+    buttonElement.onpointerdown = event => {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      longPressOrigin = { x: event.clientX, y: event.clientY };
+      longPressTimer = setTimeout(enterStoryEditMode, 520);
+    };
+    buttonElement.onpointermove = event => {
+      if (!longPressOrigin) return;
+      if (Math.hypot(event.clientX - longPressOrigin.x, event.clientY - longPressOrigin.y) > 10) cancelLongPress();
+    };
+    buttonElement.onpointerup = cancelLongPress;
+    buttonElement.onpointercancel = cancelLongPress;
+    buttonElement.oncontextmenu = event => { event.preventDefault(); enterStoryEditMode(); };
+  });
+  $$('[data-story-delete]').forEach(buttonElement => buttonElement.onclick = event => { event.stopPropagation(); deleteStoryAt(Number(buttonElement.dataset.storyDelete)); });
 }
 function showScreen(next) {
   screen = next;
@@ -122,7 +194,31 @@ function showScreen(next) {
 }
 $$('.navbtn').forEach(button => button.onclick = () => showScreen(button.dataset.screen));
 function openWord(word) { const card = document.getElementById(wordId(WORD_FORMS[word] || word)); if (!card) return; card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-function bindStudyLinks() { $$('.story-word').forEach(button => button.onclick = () => openWord(button.dataset.word)); $$('[data-back-story]').forEach(button => button.onclick = event => { event.stopPropagation(); $('#story').scrollIntoView({ behavior: 'smooth', block: 'start' }); }); }
+function bindStudyLinks() {
+  $$('.story-word').forEach(button => button.onclick = () => { speakWord(button.dataset.word); openWord(button.dataset.word); });
+  $$('[data-back-story]').forEach(button => button.onclick = event => { event.stopPropagation(); $('#story').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+}
+function deleteStoryAt(groupIndex) {
+  if (GROUPS.length <= 1) return;
+  const group = GROUPS[groupIndex];
+  if (!group || !window.confirm(`确定删除“${group.storyTitle}”吗？\n本地学习进度也会一并删除。`)) return;
+  const groupId = group.id;
+  const currentGroupId = GROUPS[gi].id;
+  Object.keys(localStorage).filter(storageKey => storageKey.startsWith(`ieltsau_${groupId}_`)).forEach(storageKey => localStorage.removeItem(storageKey));
+  const nextPack = normalizePack({ ...currentPack, groups: GROUPS.filter(group => group.id !== groupId), defaultCompleteGroups: currentPack.defaultCompleteGroups.filter(id => id !== groupId) });
+  savePack(nextPack);
+  applyPack(nextPack);
+  const currentIndex = GROUPS.findIndex(groupItem => groupItem.id === currentGroupId);
+  gi = currentIndex >= 0 ? currentIndex : Math.min(groupIndex, GROUPS.length - 1);
+  localStorage.setItem('pwaGroup', String(gi));
+  storyEditMode = false;
+  storyListOpen = false;
+  suppressStoryClick = false;
+  loadRecall();
+  loadQuiz();
+  renderAll();
+  showScreen('study');
+}
 
 function renderStudy() {
   const group = GROUPS[gi];
@@ -178,6 +274,8 @@ window.addEventListener('beforeinstallprompt', event => { event.preventDefault()
 $('#installBtn').onclick = async () => { if (!deferredPrompt) return; deferredPrompt.prompt(); await deferredPrompt.userChoice; deferredPrompt = null; $('#installBox').classList.remove('show'); };
 window.addEventListener('appinstalled', () => $('#installBox').classList.remove('show'));
 
+$('#speechToggle').onclick = toggleSpeech;
+renderSpeechToggle();
 localStorage.setItem('pwaGroup', String(gi));
 loadRecall(); loadQuiz(); renderAll(); showScreen(screen);
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
